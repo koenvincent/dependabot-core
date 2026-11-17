@@ -24,6 +24,24 @@ RSpec.describe Dependabot::Cargo::Requirement do
       it "preserves the pre-release formatting" do
         expect(requirement.requirements.first.last.to_s).to eq("4.0.0-beta3")
       end
+
+      it "matches prereleases for the same release" do
+        expect(requirement).to be_satisfied_by(Dependabot::Cargo::Version.new("4.0.0-beta4"))
+      end
+
+      it "rejects prereleases for a different release" do
+        expect(requirement).not_to be_satisfied_by(Dependabot::Cargo::Version.new("4.0.1-beta1"))
+      end
+
+      it "recognizes prerelease opt-ins with Cargo and RubyGems prefixes" do
+        ["^1.2.3-beta.1", "~1.2.3-beta.1", "~>1.2.3-beta.1"].each do |requirement_string|
+          prefixed_requirement = described_class.new(requirement_string)
+
+          expect(prefixed_requirement).to be_satisfied_by(
+            Dependabot::Cargo::Version.new("1.2.3-beta.2")
+          )
+        end
+      end
     end
 
     context "with a build-version" do
@@ -143,10 +161,47 @@ RSpec.describe Dependabot::Cargo::Requirement do
       it { is_expected.to eq(Gem::Requirement.new("> 1.5.1")) }
     end
 
-    context "with an = version specified" do
-      let(:requirement_string) { "=1.5" }
+    context "with a full = version specified" do
+      let(:requirement_string) { "=1.5.0" }
 
-      it { is_expected.to eq(Gem::Requirement.new("1.5")) }
+      it { is_expected.to eq(Gem::Requirement.new("1.5.0")) }
+    end
+
+    describe "partial comparison requirements" do
+      it "matches Cargo's version boundaries" do
+        {
+          "=0.1" => {
+            matches: %w(0.1.0 0.1.99),
+            rejects: %w(0.0.99 0.1.99-beta 0.2.0-beta 0.2.0)
+          },
+          "<=0.1" => {
+            matches: %w(0.0.99 0.1.0 0.1.99),
+            rejects: %w(0.0.99-beta 0.1.99-beta 0.2.0-beta 0.2.0)
+          },
+          "<2" => {
+            matches: %w(0.0.0 1.99.99),
+            rejects: %w(1.99.99-beta 2.0.0-beta 2.0.0)
+          },
+          ">=1.2" => {
+            matches: %w(1.2.0 1.2.99 2.0.0),
+            rejects: %w(1.1.99 1.2.99-beta 2.0.0-beta)
+          },
+          ">1.2" => {
+            matches: %w(1.3.0 2.0.0),
+            rejects: %w(1.2.0 1.2.99 1.3.0-beta 2.0.0-beta)
+          }
+        }.each do |partial_requirement, versions|
+          cargo_requirement = described_class.new(partial_requirement)
+
+          versions.fetch(:matches).each do |version|
+            expect(cargo_requirement).to be_satisfied_by(Dependabot::Cargo::Version.new(version))
+          end
+
+          versions.fetch(:rejects).each do |version|
+            expect(cargo_requirement).not_to be_satisfied_by(Dependabot::Cargo::Version.new(version))
+          end
+        end
+      end
     end
 
     context "with an ~> version specified" do
@@ -159,6 +214,16 @@ RSpec.describe Dependabot::Cargo::Requirement do
       let(:requirement_string) { ">1.5.1, < 2.0.0" }
 
       it { is_expected.to eq(Gem::Requirement.new("> 1.5.1", "< 2.0.0")) }
+    end
+
+    context "when used as a security advisory range" do
+      let(:requirement_string) { "<0.3.0" }
+      let(:prerelease_version) { Dependabot::Cargo::Version.new("0.3.0-alpha-1") }
+
+      it "compares prereleases numerically without Cargo manifest opt-in rules" do
+        expect(requirement).not_to be_satisfied_by(prerelease_version)
+        expect(requirement.satisfied_by_for_advisory?(prerelease_version)).to be(true)
+      end
     end
   end
 end

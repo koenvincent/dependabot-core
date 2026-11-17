@@ -23,6 +23,8 @@ module Dependabot
 
       PATTERN_RAW = T.let("\\s*(#{quoted})?\\s*(#{version_pattern})\\s*".freeze, String)
       PATTERN = /\A#{PATTERN_RAW}\z/
+      PARTIAL_COMPARISON_PATTERN = /\A\s*(<=|>=|=|<|>)\s*(\d+(?:\.\d+)?)\s*\z/
+      CARGO_PREFIX_PATTERN = /\A(?:\^|~(?!>))\s*/
 
       # Use Cargo::Version rather than Gem::Version to ensure that
       # pre-release versions aren't transformed.
@@ -96,7 +98,21 @@ module Dependabot
 
       sig { params(requirements: T.nilable(T.any(String, T::Array[String]))).void }
       def initialize(*requirements)
-        requirements = requirements.flatten.flat_map do |req_string|
+        raw_requirements = requirements.flatten
+        @prerelease_versions = T.let(
+          raw_requirements
+            .flat_map { |req_string| T.must(req_string).split(",") }
+            .filter_map do |req_string|
+              matches = PATTERN.match(req_string.strip.sub(CARGO_PREFIX_PATTERN, ""))
+              next unless matches&.[](2)
+
+              version = Cargo::Version.new(T.must(matches[2]))
+              version if version.prerelease?
+            end,
+          T::Array[Gem::Version]
+        )
+
+        requirements = raw_requirements.flat_map do |req_string|
           T.must(req_string).split(",").map(&:strip).map do |r|
             convert_rust_constraint_to_ruby_constraint(r.strip)
           end
@@ -105,7 +121,45 @@ module Dependabot
         super(requirements)
       end
 
+      sig { override.params(version: Gem::Version).returns(T::Boolean) }
+      def satisfied_by?(version)
+        version = Cargo::Version.new(version.to_s)
+
+        prerelease_allowed?(version) && requirements_satisfied_by?(version)
+      end
+
+      sig do
+        params(
+          version: Gem::Version,
+          prerelease_requirement: Requirement
+        ).returns(T::Boolean)
+      end
+      def satisfied_by_with_prerelease_context?(version, prerelease_requirement)
+        version = Cargo::Version.new(version.to_s)
+
+        prerelease_requirement.prerelease_allowed?(version) && requirements_satisfied_by?(version)
+      end
+
+      sig { override.params(version: Gem::Version).returns(T::Boolean) }
+      def satisfied_by_for_advisory?(version)
+        requirements_satisfied_by?(Cargo::Version.new(version.to_s))
+      end
+
+      protected
+
+      sig { params(version: Gem::Version).returns(T::Boolean) }
+      def prerelease_allowed?(version)
+        return true unless version.prerelease?
+
+        @prerelease_versions.any? { |requirement_version| requirement_version.release == version.release }
+      end
+
       private
+
+      sig { params(version: Gem::Version).returns(T::Boolean) }
+      def requirements_satisfied_by?(version)
+        requirements.all? { |operator, requirement| (OPS[operator] || OPS["="]).call(version, requirement) }
+      end
 
       sig { params(req_string: String).returns(T.any(String, T::Array[String])) }
       def convert_rust_constraint_to_ruby_constraint(req_string)
@@ -113,9 +167,32 @@ module Dependabot
           ruby_range(req_string.gsub(/(?:\.|^)[*]/, "").gsub(/^[^\d]/, ""))
         elsif req_string.match?(/^~[^>]/) then convert_tilde_req(req_string)
         elsif req_string.match?(/^[\d^]/) then convert_caret_req(req_string)
-        elsif req_string.match?(/[<=>]/) then req_string
+        elsif req_string.match?(/[<=>]/) then convert_comparison_req(req_string)
         else
           ruby_range(req_string)
+        end
+      end
+
+      sig { params(req_string: String).returns(T.any(String, T::Array[String])) }
+      def convert_comparison_req(req_string)
+        matches = PARTIAL_COMPARISON_PATTERN.match(req_string)
+        return req_string unless matches
+
+        operator = T.must(matches[1])
+        parts = T.must(matches[2]).split(".").map(&:to_i)
+        lower_bound = (parts + Array.new(3 - parts.length, 0)).join(".")
+        upper_parts = parts.map.with_index do |part, index|
+          index == parts.length - 1 ? part + 1 : part
+        end
+        upper_bound = (upper_parts + Array.new(3 - upper_parts.length, 0)).join(".")
+
+        case operator
+        when "=" then [">= #{lower_bound}", "< #{upper_bound}"]
+        when "<=" then "< #{upper_bound}"
+        when "<" then "< #{lower_bound}"
+        when ">=" then ">= #{lower_bound}"
+        when ">" then ">= #{upper_bound}"
+        else req_string
         end
       end
 
